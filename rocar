@@ -1,0 +1,727 @@
+--// Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DataStoreService = game:GetService("DataStoreService")
+local RunService = game:GetService("RunService")
+
+--// Remotes bootstrap --------------------------------------------------------
+local RemotesFolder = ReplicatedStorage:FindFirstChild("RoyalX_Remotes")
+if not RemotesFolder then
+	RemotesFolder = Instance.new("Folder")
+	RemotesFolder.Name = "RoyalX_Remotes"
+	RemotesFolder.Parent = ReplicatedStorage
+end
+
+local function ensureRemote(name, class)
+	local r = RemotesFolder:FindFirstChild(name)
+	if not r then
+		r = Instance.new(class)
+		r.Name = name
+		r.Parent = RemotesFolder
+	end
+	return r
+end
+
+local RF_ExecCommand = ensureRemote("ExecCommand", "RemoteFunction")
+local RE_Notify     = ensureRemote("Notify", "RemoteEvent")
+local RF_PullPlayers= ensureRemote("PullPlayers", "RemoteFunction")
+local RE_PushLog    = ensureRemote("PushLog", "RemoteEvent")
+
+--// Config ------------------------------------------------------------------
+local CONFIG = {
+	SystemName = "RoyalX Admin",
+	Version = "v2.0",
+	-- Assign roles by UserId
+	Roles = {
+		Owner = { 9274570735 }, -- TODO: put your UserId(s)
+		Admin = { },
+		Mod   = { },
+	},
+	-- Which role has which power level (bigger = higher)
+	RolePower = { Owner = 100, Admin = 70, Mod = 40, Guest = 0 },
+	-- Command allowlist by minimal power required
+	CommandPower = {
+		announce  = 40,
+		kick      = 40,
+		ban       = 70,
+		unban     = 70,
+		mute      = 40,
+		unmute    = 40,
+		freeze    = 40,
+		unfreeze  = 40,
+		heal      = 40,
+		speed     = 40,
+		jump      = 40,
+		tp        = 40,
+		bring     = 40,
+		respawn   = 40,
+	},
+	-- Rate limiting (per user)
+	RateLimit = {
+		Burst = 5,        -- max commands in window
+		WindowSec = 8,    -- per N seconds
+	},
+	-- Datastores
+	Datastores = {
+		Bans = "RoyalX_Bans_v1",
+		Mutes = "RoyalX_Mutes_v1",
+	},
+}
+
+--// Helper: set membership ---------------------------------------------------
+local function listToSet(t)
+	local s = {}
+	for _,v in ipairs(t or {}) do s[v] = true end
+	return s
+end
+
+local RoleSets = {
+	Owner = listToSet(CONFIG.Roles.Owner),
+	Admin = listToSet(CONFIG.Roles.Admin),
+	Mod   = listToSet(CONFIG.Roles.Mod),
+}
+
+local function getRole(userId)
+	if RoleSets.Owner[userId] then return "Owner" end
+	if RoleSets.Admin[userId] then return "Admin" end
+	if RoleSets.Mod[userId]   then return "Mod"   end
+	return "Guest"
+end
+
+local function getPower(userId)
+	local role = getRole(userId)
+	return CONFIG.RolePower[role] or 0
+end
+
+--// DataStore-backed bans/mutes ---------------------------------------------
+local BanDS  = DataStoreService:GetDataStore(CONFIG.Datastores.Bans)
+local MuteDS = DataStoreService:GetDataStore(CONFIG.Datastores.Mutes)
+
+local Bans  = {} -- [userId] = {reason=..., by=..., t=os.time()}
+local Mutes = {} -- [userId] = {reason=..., by=..., t=os.time()}
+
+local function tryGet(ds, key)
+	local ok, res = pcall(function() return ds:GetAsync(key) end)
+	if ok then return res else return nil end
+end
+
+local function trySet(ds, key, val)
+	pcall(function() ds:SetAsync(key, val) end)
+end
+
+local function loadPunishments()
+	-- Lazy: we load on demand per user in join handler; this function kept for clarity
+end
+
+--// Logging helper -----------------------------------------------------------
+local function pushLog(plr, line)
+	RE_PushLog:FireClient(plr, line)
+end
+
+--// Player Join/Leave --------------------------------------------------------
+Players.PlayerAdded:Connect(function(plr)
+	-- Check if banned
+	local b = tryGet(BanDS, tostring(plr.UserId))
+	if b then
+		Bans[plr.UserId] = b
+		plr:Kick(string.format("BANNED: %s\nBy: %s\nAt: %s", b.reason or "No reason", b.by or "unknown", os.date("%Y-%m-%d %H:%M:%S", b.t or os.time())))
+		return
+	end
+	-- Load mute state (if any)
+	local m = tryGet(MuteDS, tostring(plr.UserId))
+	if m then Mutes[plr.UserId] = m end
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+	-- nothing special; datastore persistence already handled at write-time
+end)
+
+--// Rate limiting ------------------------------------------------------------
+local Buckets = {} -- [userId] = {count, t0}
+
+local function allowedToRun(userId)
+	local now = os.time()
+	local b = Buckets[userId]
+	if not b then
+		Buckets[userId] = {count=1, t0=now}
+		return true
+	end
+	local dt = now - b.t0
+	if dt > CONFIG.RateLimit.WindowSec then
+		b.count = 1
+		b.t0 = now
+		return true
+	end
+	if b.count < CONFIG.RateLimit.Burst then
+		b.count += 1
+		return true
+	end
+	return false
+end
+
+--// Utility: find players by partial ----------------------------------------
+local function findPlayersByQuery(q)
+	q = q:lower()
+	local out = {}
+	for _,p in ipairs(Players:GetPlayers()) do
+		if p.Name:lower():find(q, 1, true) or p.DisplayName:lower():find(q, 1, true) or tostring(p.UserId) == q then
+			table.insert(out, p)
+		end
+	end
+	return out
+end
+
+--// Permission check ---------------------------------------------------------
+local function canRun(userId, cmdName)
+	local need = CONFIG.CommandPower[cmdName]
+	if not need then return false, "Unknown command" end
+	local power = getPower(userId)
+	if power >= need then return true else return false, "Insufficient power" end
+end
+
+--// Command implementations --------------------------------------------------
+local Commands = {}
+
+function Commands.announce(invoker, args)
+	local text = table.concat(args, " ")
+	if text == "" then return false, "Message required" end
+	for _,p in ipairs(Players:GetPlayers()) do
+		RE_Notify:FireClient(p, text, "Warn")
+	end
+	return true
+end
+
+function Commands.kick(invoker, args)
+	local who = args[1]
+	local reason = table.concat(args, " ", 2)
+	if not who then return false, "Usage: /kick <player> [reason]" end
+	local targets = findPlayersByQuery(who)
+	if #targets == 0 then return false, "Player not found" end
+	for _,t in ipairs(targets) do
+		t:Kick(reason ~= "" and ("Kicked: "..reason) or "Kicked by admin")
+	end
+	return true
+end
+
+function Commands.ban(invoker, args)
+	local who = args[1]
+	local reason = table.concat(args, " ", 2)
+	if not who then return false, "Usage: /ban <player> [reason]" end
+	local targets = findPlayersByQuery(who)
+	if #targets == 0 then return false, "Player not found" end
+	for _,t in ipairs(targets) do
+		local b = {reason = reason ~= "" and reason or "No reason", by = invoker.Name, t = os.time()}
+		Bans[t.UserId] = b
+		trySet(BanDS, tostring(t.UserId), b)
+		t:Kick("BANNED: "..b.reason)
+	end
+	return true
+end
+
+function Commands.unban(invoker, args)
+	local userId = tonumber(args[1])
+	if not userId then return false, "Usage: /unban <UserId>" end
+	Bans[userId] = nil
+	trySet(BanDS, tostring(userId), nil)
+	return true
+end
+
+function Commands.mute(invoker, args)
+	local who = args[1]
+	local reason = table.concat(args, " ", 2)
+	if not who then return false, "Usage: /mute <player> [reason]" end
+	local targets = findPlayersByQuery(who)
+	if #targets == 0 then return false, "Player not found" end
+	for _,t in ipairs(targets) do
+		local m = {reason = reason ~= "" and reason or "No reason", by = invoker.Name, t = os.time()}
+		Mutes[t.UserId] = m
+		trySet(MuteDS, tostring(t.UserId), m)
+		RE_Notify:FireClient(t, "You have been muted", "Warn")
+	end
+	return true
+end
+
+function Commands.unmute(invoker, args)
+	local who = args[1]
+	if not who then return false, "Usage: /unmute <player>" end
+	local targets = findPlayersByQuery(who)
+	if #targets == 0 then return false, "Player not found" end
+	for _,t in ipairs(targets) do
+		Mutes[t.UserId] = nil
+		trySet(MuteDS, tostring(t.UserId), nil)
+		RE_Notify:FireClient(t, "You have been unmuted", "Success")
+	end
+	return true
+end
+
+function Commands.freeze(invoker, args)
+	local who = args[1]
+	if not who then return false, "Usage: /freeze <player>" end
+	local targets = findPlayersByQuery(who)
+	if #targets == 0 then return false, "Player not found" end
+	for _,t in ipairs(targets) do
+		local char = t.Character or t.CharacterAdded:Wait()
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then hum.WalkSpeed = 0; hum.JumpPower = 0 end
+	end
+	return true
+end
+
+function Commands.unfreeze(invoker, args)
+	local who = args[1]
+	if not who then return false, "Usage: /unfreeze <player>" end
+	local targets = findPlayersByQuery(who)
+	if #targets == 0 then return false, "Player not found" end
+	for _,t in ipairs(targets) do
+		local char = t.Character or t.CharacterAdded:Wait()
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then hum.WalkSpeed = 16; hum.JumpPower = 50 end
+	end
+	return true
+end
+
+function Commands.heal(invoker, args)
+	local who = args[1] or invoker.Name
+	local targets = findPlayersByQuery(who)
+	if #targets == 0 then return false, "Player not found" end
+	for _,t in ipairs(targets) do
+		local hum = (t.Character or t.CharacterAdded:Wait()):FindFirstChildOfClass("Humanoid")
+		if hum then hum.Health = hum.MaxHealth end
+	end
+	return true
+end
+
+function Commands.speed(invoker, args)
+	local who = args[1]
+	local spd = tonumber(args[2])
+	if not who or not spd then return false, "Usage: /speed <player> <number>" end
+	for _,t in ipairs(findPlayersByQuery(who)) do
+		local hum = (t.Character or t.CharacterAdded:Wait()):FindFirstChildOfClass("Humanoid")
+		if hum then hum.WalkSpeed = spd end
+	end
+	return true
+end
+
+function Commands.jump(invoker, args)
+	local who = args[1]
+	local jp = tonumber(args[2])
+	if not who or not jp then return false, "Usage: /jump <player> <number>" end
+	for _,t in ipairs(findPlayersByQuery(who)) do
+		local hum = (t.Character or t.CharacterAdded:Wait()):FindFirstChildOfClass("Humanoid")
+		if hum then hum.JumpPower = jp end
+	end
+	return true
+end
+
+function Commands.tp(invoker, args)
+	local src = invoker
+	local who = args[1]
+	if not who then return false, "Usage: /tp <player>" end
+	local targets = findPlayersByQuery(who)
+	if #targets == 0 then return false, "Player not found" end
+	local t = targets[1]
+	local sChar = src.Character or src.CharacterAdded:Wait()
+	local tChar = t.Character or t.CharacterAdded:Wait()
+	local sH = sChar:FindFirstChild("HumanoidRootPart")
+	local tH = tChar:FindFirstChild("HumanoidRootPart")
+	if sH and tH then sH.CFrame = tH.CFrame end
+	return true
+end
+
+function Commands.bring(invoker, args)
+	local who = args[1]
+	if not who then return false, "Usage: /bring <player>" end
+	local targets = findPlayersByQuery(who)
+	if #targets == 0 then return false, "Player not found" end
+	local invChar = invoker.Character or invoker.CharacterAdded:Wait()
+	local invH = invChar:FindFirstChild("HumanoidRootPart")
+	if not invH then return false, "No HRP" end
+	for _,t in ipairs(targets) do
+		local c = t.Character or t.CharacterAdded:Wait()
+		local h = c:FindFirstChild("HumanoidRootPart")
+		if h then h.CFrame = invH.CFrame * CFrame.new(1,0,1) end
+	end
+	return true
+end
+
+function Commands.respawn(invoker, args)
+	local who = args[1] or invoker.Name
+	for _,t in ipairs(findPlayersByQuery(who)) do
+		t:LoadCharacter()
+	end
+	return true
+end
+
+--// Exec dispatcher ----------------------------------------------------------
+local function exec(invoker, cmdLine)
+	-- basic parse
+	local tokens = {}
+	for tk in string.gmatch(cmdLine, "[^%s]+") do table.insert(tokens, tk) end
+	local name = (tokens[1] or ""):lower()
+	if name == "" then return false, "Empty command" end
+	table.remove(tokens, 1)
+
+	-- perms
+	local okPerm, why = canRun(invoker.UserId, name)
+	if not okPerm then return false, why end
+
+	-- rate limit
+	if not allowedToRun(invoker.UserId) then return false, "Rate limit: slow down" end
+
+	local fn = Commands[name]
+	if not fn then return false, "Unknown command" end
+	local ok, err = pcall(fn, invoker, tokens)
+	if ok then return true else return false, tostring(err) end
+end
+
+-- Client → Server command call
+RF_ExecCommand.OnServerInvoke = function(plr, cmdLine)
+	local ok, err = exec(plr, cmdLine or "")
+	if ok then
+		RE_Notify:FireClient(plr, "Command executed", "Success")
+		pushLog(plr, "[OK] "..cmdLine)
+		return true
+	else
+		RE_Notify:FireClient(plr, err or "Error", "Error")
+		pushLog(plr, "[ERR] "..(err or "unknown"))
+		return false, err
+	end
+end
+
+-- Players list
+RF_PullPlayers.OnServerInvoke = function(plr)
+	local list = {}
+	for _,p in ipairs(Players:GetPlayers()) do
+		list[#list+1] = {name=p.Name, display=p.DisplayName, userId=p.UserId}
+	end
+	return list, {
+		role = getRole(plr.UserId),
+		power = getPower(plr.UserId),
+	}
+end
+
+--================================================================================
+-- (B) CLIENT: RoyalX_Client.client.lua
+--================================================================================
+
+--// Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local LP = Players.LocalPlayer
+
+--// Remotes
+local Remotes = ReplicatedStorage:WaitForChild("RoyalX_Remotes")
+local RF_ExecCommand = Remotes:WaitForChild("ExecCommand")
+local RE_Notify     = Remotes:WaitForChild("Notify")
+local RF_PullPlayers= Remotes:WaitForChild("PullPlayers")
+local RE_PushLog    = Remotes:WaitForChild("PushLog")
+
+--// UI Config ----------------------------------------------------------------
+local UI = {
+	Title = "RoyalX Admin",
+	Version = "v2.0",
+	HotkeyOpen = Enum.KeyCode.RightControl,
+	Theme = {
+		Background = Color3.fromRGB(15, 16, 18),
+		Panel = Color3.fromRGB(24, 25, 30),
+		Card = Color3.fromRGB(30, 32, 38),
+		Accent = Color3.fromRGB(0, 174, 255),
+		Text = Color3.fromRGB(235, 235, 240),
+		SubtleText = Color3.fromRGB(180, 180, 192),
+		Stroke = Color3.fromRGB(55, 55, 65),
+		Success = Color3.fromRGB(85, 189, 102),
+		Warning = Color3.fromRGB(255, 196, 0),
+		Error = Color3.fromRGB(255, 84, 84),
+	},
+	Corner = UDim.new(0, 14),
+	Size = Vector2.new(900, 560),
+	Sidebar = 200,
+}
+
+--// Helpers ------------------------------------------------------------------
+local function mk(class, props, children)
+	local o = Instance.new(class)
+	for k,v in pairs(props or {}) do o[k] = v end
+	for _,c in ipairs(children or {}) do c.Parent = o end
+	return o
+end
+local function corner(p) return mk("UICorner", {Parent=p, CornerRadius=UI.Corner}) end
+local function stroke(p,t) return mk("UIStroke", {Parent=p, Color=UI.Theme.Stroke, Thickness=t or 1, Transparency=0.2}) end
+local function tween(o,ti,g) TweenService:Create(o,ti,g):Play() end
+
+--// ScreenGui + Window -------------------------------------------------------
+local SG = mk("ScreenGui", {Name="RoyalX_UI", ResetOnSpawn=false, ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
+SG.Parent = LP:WaitForChild("PlayerGui")
+
+local Window = mk("Frame", {
+	Parent=SG, BackgroundColor3=UI.Theme.Panel,
+	Size=UDim2.fromOffset(UI.Size.X, UI.Size.Y),
+	AnchorPoint=Vector2.new(0.5,0.5), Position=UDim2.fromScale(0.5,0.5), Visible=false
+})
+corner(Window) ; stroke(Window,1)
+
+mk("ImageLabel", {Parent=Window, BackgroundTransparency=1, Image="rbxassetid://1316045217",
+	ScaleType=Enum.ScaleType.Slice, SliceCenter=Rect.new(10,10,118,118),
+	Size=UDim2.new(1,40,1,40), Position=UDim2.fromOffset(-20,-20), ImageTransparency=0.7
+})
+
+local Header = mk("Frame", {Parent=Window, BackgroundTransparency=1, Size=UDim2.new(1,-20,0,58), Position=UDim2.new(0,10,0,8)})
+local Title = mk("TextLabel", {Parent=Header, BackgroundTransparency=1, Text=UI.Title.."  "..UI.Version,
+	Font=Enum.Font.GothamBold, TextSize=18, TextColor3=UI.Theme.Text, Size=UDim2.new(1,-200,1,0),
+	TextXAlignment=Enum.TextXAlignment.Left})
+
+local BtnMin = mk("TextButton",{Parent=Header,Text="—",Font=Enum.Font.GothamBold,TextSize=16,TextColor3=UI.Theme.Text,
+	BackgroundColor3=UI.Theme.Card, Size=UDim2.new(0,36,0,28), AnchorPoint=Vector2.new(1,0.5), Position=UDim2.new(1,-84,0.5,0), AutoButtonColor=false})
+corner(BtnMin) ; stroke(BtnMin)
+
+local BtnClose = mk("TextButton",{Parent=Header,Text="✕",Font=Enum.Font.GothamBold,TextSize=16,TextColor3=UI.Theme.Text,
+	BackgroundColor3=UI.Theme.Card, Size=UDim2.new(0,36,0,28), AnchorPoint=Vector2.new(1,0.5), Position=UDim2.new(1,-40,0.5,0), AutoButtonColor=false})
+corner(BtnClose) ; stroke(BtnClose)
+
+local Sidebar = mk("Frame", {Parent=Window, BackgroundTransparency=1, Size=UDim2.new(0,UI.Sidebar,1,-86), Position=UDim2.new(0,10,0,70)})
+local TabsLayout = mk("UIListLayout", {Parent=Sidebar, Padding=UDim.new(0,10)})
+
+local Content = mk("Frame", {Parent=Window, BackgroundColor3=UI.Theme.Card,
+	Size=UDim2.new(1, -UI.Sidebar-30, 1, -86), Position=UDim2.new(0, UI.Sidebar+20, 0, 70), ClipsDescendants=true})
+corner(Content); stroke(Content)
+
+local Pages = mk("Frame", {Parent=Content, BackgroundTransparency=1, Size=UDim2.fromScale(1,1)})
+local Layout = mk("UIPageLayout", {Parent=Pages, TweenTime=0.25, EasingStyle=Enum.EasingStyle.Quad, EasingDirection=Enum.EasingDirection.Out})
+
+local function newPage(name)
+	return mk("Frame", {Name=name, Parent=Pages, BackgroundTransparency=1, Size=UDim2.fromScale(1,1)})
+end
+
+local PageConsole  = newPage("Console")
+local PageCommands = newPage("Commands")
+local PagePlayers  = newPage("Players")
+local PageSettings = newPage("Settings")
+
+local function tabButton(label)
+	local b = mk("TextButton", {Parent=Sidebar, Text=label, Font=Enum.Font.Gotham, TextSize=15, TextColor3=UI.Theme.SubtleText,
+		BackgroundColor3=UI.Theme.Card, AutoButtonColor=false, Size=UDim2.new(1,0,0,38)})
+	corner(b); stroke(b)
+	b.MouseEnter:Connect(function() tween(b, TweenInfo.new(0.12), {BackgroundColor3=UI.Theme.Accent, TextColor3=Color3.new(1,1,1)}) end)
+	b.MouseLeave:Connect(function() tween(b, TweenInfo.new(0.12), {BackgroundColor3=UI.Theme.Card, TextColor3=UI.Theme.SubtleText}) end)
+	return b
+end
+
+local BtnConsole  = tabButton("Console")
+local BtnCommands = tabButton("Commands")
+local BtnPlayers  = tabButton("Players")
+local BtnSettings = tabButton("Settings")
+
+BtnConsole.MouseButton1Click:Connect(function()  Layout:JumpTo(PageConsole)  end)
+BtnCommands.MouseButton1Click:Connect(function() Layout:JumpTo(PageCommands) end)
+BtnPlayers.MouseButton1Click:Connect(function()  Layout:JumpTo(PagePlayers)  end)
+BtnSettings.MouseButton1Click:Connect(function() Layout:JumpTo(PageSettings) end)
+
+--// Dragging ---------------------------------------------------------------
+local dragging, dragStart, startPos
+Header.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = true
+		dragStart = input.Position
+		startPos = Window.Position
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then dragging = false end
+		end)
+	end
+end)
+Header.InputChanged:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseMovement and dragging then
+		local delta = input.Position - dragStart
+		Window.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+	end
+end)
+
+--// Console (output + input) -----------------------------------------------
+local ConsoleOut = mk("TextBox", {Parent=PageConsole, MultiLine=true, ClearTextOnFocus=false, TextEditable=false, Text="",
+	PlaceholderText="Console output...", TextColor3=UI.Theme.Text, Font=Enum.Font.Code, TextSize=14,
+	BackgroundColor3=UI.Theme.Panel, Size=UDim2.new(1,-20,1,-84), Position=UDim2.new(0,10,0,10),
+	TextXAlignment=Enum.TextXAlignment.Left, TextYAlignment=Enum.TextYAlignment.Top})
+corner(ConsoleOut); stroke(ConsoleOut)
+
+local ConsoleIn = mk("TextBox", {Parent=PageConsole, Text="", PlaceholderText="Type /help or a command...",
+	TextColor3=UI.Theme.Text, Font=Enum.Font.Code, TextSize=16, ClearTextOnFocus=false,
+	BackgroundColor3=UI.Theme.Panel, Size=UDim2.new(1,-20,0,44), Position=UDim2.new(0,10,1,-54)})
+corner(ConsoleIn); stroke(ConsoleIn)
+
+local function clog(msg)
+	ConsoleOut.Text = (ConsoleOut.Text ~= "" and ConsoleOut.Text.."\n" or "") .. tostring(msg)
+	ConsoleOut.CursorPosition = #ConsoleOut.Text
+end
+
+RE_PushLog.OnClientEvent:Connect(function(line) clog(line) end)
+
+ConsoleIn.FocusLost:Connect(function(enter)
+	if not enter then return end
+	local line = ConsoleIn.Text
+	ConsoleIn.Text = ""
+	if line == "" then return end
+	clog("> "..line)
+	local ok, err = RF_ExecCommand:InvokeServer(line)
+	if not ok then clog("! "..(err or "Error")) end
+end)
+
+--// Commands Page (list of server commands) --------------------------------
+local CmdList = mk("ScrollingFrame", {Parent=PageCommands, Active=true, AutomaticCanvasSize=Enum.AutomaticSize.Y,
+	ScrollBarThickness=6, BackgroundTransparency=1, Size=UDim2.new(1,-20,1,-20), Position=UDim2.new(0,10,0,10)})
+local CmdLayout = mk("UIListLayout", {Parent=CmdList, Padding=UDim.new(0,8)})
+
+local CommandMeta = {
+	{ name="announce", desc="Broadcast a message to all players: /announce <text>" },
+	{ name="kick",     desc="Kick player(s): /kick <name|id> [reason]" },
+	{ name="ban",      desc="Ban player(s): /ban <name|id> [reason]" },
+	{ name="unban",    desc="Unban by UserId: /unban <id>" },
+	{ name="mute",     desc="Mute player(s): /mute <name|id> [reason]" },
+	{ name="unmute",   desc="Unmute player(s): /unmute <name|id>" },
+	{ name="freeze",   desc="Freeze player(s): /freeze <name|id>" },
+	{ name="unfreeze", desc="Unfreeze player(s): /unfreeze <name|id>" },
+	{ name="heal",     desc="Heal player(s): /heal [name|id]" },
+	{ name="speed",    desc="Set WalkSpeed: /speed <name|id> <num>" },
+	{ name="jump",     desc="Set JumpPower: /jump <name|id> <num>" },
+	{ name="tp",       desc="Teleport to player: /tp <name|id>" },
+	{ name="bring",    desc="Bring player(s) to you: /bring <name|id>" },
+	{ name="respawn",  desc="Respawn player(s): /respawn [name|id]" },
+}
+
+local function addCmdCard(n, d)
+	local card = mk("Frame", {Parent=CmdList, BackgroundColor3=UI.Theme.Panel, Size=UDim2.new(1,0,0,64)})
+	corner(card); stroke(card)
+	mk("TextLabel", {Parent=card, BackgroundTransparency=1, Text="/"..n, Font=Enum.Font.GothamBold,
+		TextSize=15, TextColor3=UI.Theme.Text, TextXAlignment=Enum.TextXAlignment.Left,
+		Position=UDim2.new(0,14,0,8), Size=UDim2.new(1,-28,0,22)})
+	mk("TextLabel", {Parent=card, BackgroundTransparency=1, Text=d, Font=Enum.Font.Gotham,
+		TextSize=13, TextColor3=UI.Theme.SubtleText, TextXAlignment=Enum.TextXAlignment.Left,
+		Position=UDim2.new(0,14,0,30), Size=UDim2.new(1,-28,0,22)})
+end
+
+for _,meta in ipairs(CommandMeta) do addCmdCard(meta.name, meta.desc) end
+
+--// Players Page ------------------------------------------------------------
+local SearchBox = mk("TextBox", {Parent=PagePlayers, Text="", PlaceholderText="Search players...",
+	TextColor3=UI.Theme.Text, Font=Enum.Font.Gotham, TextSize=14, ClearTextOnFocus=false,
+	BackgroundColor3=UI.Theme.Panel, Size=UDim2.new(1,-20,0,36), Position=UDim2.new(0,10,0,10)})
+corner(SearchBox); stroke(SearchBox)
+
+local PlayerList = mk("ScrollingFrame", {Parent=PagePlayers, Active=true, AutomaticCanvasSize=Enum.AutomaticSize.Y,
+	ScrollBarThickness=6, BackgroundTransparency=1, Size=UDim2.new(1,-20,1,-66), Position=UDim2.new(0,10,0,56)})
+local PlayerLayout = mk("UIListLayout", {Parent=PlayerList, Padding=UDim.new(0,8)})
+
+local LastPlayers = {}
+
+local function drawPlayers(filter)
+	PlayerList:ClearAllChildren()
+	PlayerLayout.Parent = PlayerList
+	for _,p in ipairs(LastPlayers) do
+		local label = (p.display or p.name)
+		if not filter or filter == "" or label:lower():find(filter:lower(), 1, true) or tostring(p.userId) == filter then
+			local row = mk("Frame", {Parent=PlayerList, BackgroundColor3=UI.Theme.Panel, Size=UDim2.new(1,0,0,60)})
+			corner(row); stroke(row)
+			mk("TextLabel", {Parent=row, BackgroundTransparency=1, Text=string.format("%s (@%s)", p.display, p.name),
+				Font=Enum.Font.GothamMedium, TextSize=14, TextColor3=UI.Theme.Text, TextXAlignment=Enum.TextXAlignment.Left,
+				Position=UDim2.new(0,14,0,8), Size=UDim2.new(1,-160,0,20)})
+			mk("TextLabel", {Parent=row, BackgroundTransparency=1, Text="UserId: "..p.userId, Font=Enum.Font.Code, TextSize=12,
+				TextColor3=UI.Theme.SubtleText, TextXAlignment=Enum.TextXAlignment.Left, Position=UDim2.new(0,14,0,30), Size=UDim2.new(1,-160,0,20)})
+			local act = mk("TextButton", {Parent=row, Text="…", Font=Enum.Font.GothamMedium, TextSize=14, TextColor3=UI.Theme.Text,
+				BackgroundColor3=UI.Theme.Card, Size=UDim2.new(0,48,0,30), Position=UDim2.new(1,-58,0.5,-15), AutoButtonColor=false})
+			corner(act); stroke(act)
+			act.MouseButton1Click:Connect(function()
+				-- Quick actions popup (simple)
+				RE_Notify:FireServer() -- no-op; we use console instead
+				clog("Hint: Use /kick "..p.name.."  or /ban "..p.name.."  etc.")
+			end)
+		end
+	end
+end
+
+local function refreshPlayers()
+	local list, selfMeta = RF_PullPlayers:InvokeServer()
+	LastPlayers = list or {}
+	drawPlayers(SearchBox.Text)
+	-- Header shows role
+	Title.Text = UI.Title.."  "..UI.Version.."  •  Role: "..(selfMeta and selfMeta.role or "Guest")
+end
+
+SearchBox:GetPropertyChangedSignal("Text"):Connect(function() drawPlayers(SearchBox.Text) end)
+
+--// Settings Page -----------------------------------------------------------
+mk("TextLabel", {Parent=PageSettings, BackgroundTransparency=1, Text="Open/Close Hotkey:",
+	Font=Enum.Font.Gotham, TextSize=14, TextColor3=UI.Theme.SubtleText, Position=UDim2.new(0,14,0,16), Size=UDim2.new(0,170,0,24)})
+
+local KeyBtn = mk("TextButton", {Parent=PageSettings, Text=UI.HotkeyOpen.Name, Font=Enum.Font.GothamMedium, TextSize=14,
+	TextColor3=UI.Theme.Text, BackgroundColor3=UI.Theme.Panel, Size=UDim2.new(0,160,0,32), Position=UDim2.new(0,190,0,14), AutoButtonColor=false})
+corner(KeyBtn); stroke(KeyBtn)
+
+KeyBtn.MouseButton1Click:Connect(function()
+	KeyBtn.Text = "Press a key..."
+	local conn
+	conn = UserInputService.InputBegan:Connect(function(input,gp)
+		if gp then return end
+		if input.UserInputType == Enum.UserInputType.Keyboard then
+			UI.HotkeyOpen = input.KeyCode
+			KeyBtn.Text = UI.HotkeyOpen.Name
+			if conn then conn:Disconnect() end
+			RE_Notify:FireClient(LP, "Hotkey set to "..UI.HotkeyOpen.Name, "Success")
+		end
+	end)
+end)
+
+-- Footer
+mk("TextLabel", {Parent=Window, BackgroundTransparency=1, Text="© "..os.date("%Y").." RoyalX • Admin UI",
+	Font=Enum.Font.Gotham, TextSize=12, TextColor3=UI.Theme.SubtleText, Size=UDim2.new(1,-20,0,18), Position=UDim2.new(0,10,1,-22),
+	TextXAlignment=Enum.TextXAlignment.Left})
+
+--// Notifications -----------------------------------------------------------
+local NotifRoot = mk("Frame", {Parent=SG, AnchorPoint=Vector2.new(1,0), Position=UDim2.fromScale(0.985,0.02), Size=UDim2.new(0,320,1,-40), BackgroundTransparency=1})
+local NotifList = mk("UIListLayout", {Parent=NotifRoot, Padding=UDim.new(0,8), HorizontalAlignment=Enum.HorizontalAlignment.Right, VerticalAlignment=Enum.VerticalAlignment.Top})
+
+local function pushNotif(text, kind)
+	kind = kind or "Info"
+	local color = UI.Theme.Accent
+	if kind=="Success" then color=UI.Theme.Success elseif kind=="Warning" then color=UI.Theme.Warning elseif kind=="Error" then color=UI.Theme.Error end
+	local card = mk("Frame", {Parent=NotifRoot, BackgroundColor3=UI.Theme.Card, Size=UDim2.new(0,300,0,0), ClipsDescendants=true})
+	corner(card); stroke(card)
+	mk("Frame", {Parent=card, BackgroundColor3=color, Size=UDim2.new(0,4,1,0)})
+	mk("TextLabel", {Parent=card, BackgroundTransparency=1, Text=text, Font=Enum.Font.Gotham, TextSize=15, TextColor3=UI.Theme.Text, TextXAlignment=Enum.TextXAlignment.Left, Position=UDim2.new(0,12,0,10), Size=UDim2.new(1,-24,1,-20)})
+	tween(card, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Size=UDim2.new(0,300,0,54)})
+	task.delay(3.0, function()
+		tween(card, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Size=UDim2.new(0,300,0,0)})
+		task.wait(0.22)
+		card:Destroy()
+	end)
+end
+
+RE_Notify.OnClientEvent:Connect(function(text, kind) pushNotif(text, kind) end)
+
+--// Open/Close + Minimize ---------------------------------------------------
+local isOpen, minimized = false, false
+local function setVisible(v)
+	isOpen = v
+	Window.Visible = v
+end
+
+BtnMin.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	if minimized then tween(Window, TweenInfo.new(0.2), {Size=UDim2.fromOffset(UI.Size.X, 62)})
+	else tween(Window, TweenInfo.new(0.2), {Size=UDim2.fromOffset(UI.Size.X, UI.Size.Y)}) end
+end)
+
+BtnClose.MouseButton1Click:Connect(function() setVisible(false) end)
+
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if input.KeyCode == UI.HotkeyOpen then setVisible(not isOpen) end
+end)
+
+--// Initial data ------------------------------------------------------------
+setVisible(true) -- auto-open on spawn; change if you prefer
+refreshPlayers()
+Layout:JumpTo(PageConsole)
+pushNotif("RoyalX panel loaded", "Success")
+
+--// END OF FILES ------------------------------------------------------------
